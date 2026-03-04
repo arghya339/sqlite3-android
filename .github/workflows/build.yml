@@ -1,0 +1,324 @@
+name: Build SQLite for Android
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at 00:00 UTC
+
+jobs:
+  version-check:
+    runs-on: macOS-latest
+    outputs:
+      should-build: ${{ steps.compare.outputs.build }}
+    steps:
+      - name: Get GitHub release version
+        id: github_version
+        run: |
+          VERSION=$(curl -sL https://github.com/${{ github.repository }}/releases/tag/all | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "github_version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Get SQLite.org version
+        id: sqlite_version
+        run: |
+          VERSION=$(curl -s https://sqlite.org/ | grep -oE 'Version [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2)
+          echo "sqlite_version=$VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Compare versions
+        id: compare
+        run: |
+          if [[ "${{ steps.github_version.outputs.github_version }}" != "${{ steps.sqlite_version.outputs.sqlite_version }}" ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "New version detected"
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+            echo "Versions match"
+          fi
+
+  build:
+    needs: version-check
+    if: ${{ needs.version-check.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: macOS-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'adopt'
+          java-version: '11'
+
+      - name: Install NDK
+        run: |
+          # Get latest LTS NDK version
+          latestNDK=$(curl -sL https://developer.android.com/ndk/downloads | grep 'Latest LTS Version' | sed -n 's/.*(\(.*\)).*/\1/p')
+          ndkVersion=$(curl -sL https://developer.android.com/ndk/downloads | grep -o 'ndkVersion "[^"]*"' | head -n1 | sed 's/ndkVersion "\(.*\)"/\1/')
+          ndkBuildNumber=$(curl -sL https://developer.android.com/ndk/downloads | grep -o 'ndkVersion "[^"]*"' | head -n1 | sed 's/ndkVersion "\(.*\)"/\1/' | cut -d. -f3)
+          echo "Latest NDK LTS Version: $latestNDK"
+          # Download the NDK .dmg file
+          wget https://dl.google.com/android/repository/android-ndk-${latestNDK}-darwin.dmg -O android-ndk-${latestNDK}.dmg
+        
+          # Mount the .dmg file
+          hdiutil attach android-ndk-${latestNDK}.dmg
+        
+          # List the contents of the mounted volume to find the correct NDK folder
+          echo "Listing the contents of the mounted volume:"
+          ls -l /Volumes/Android\ NDK\ ${latestNDK}
+        
+          # List the contents of the AndroidNDK${ndkBuildNumber}.app folder
+          echo "Listing contents of the AndroidNDK${ndkBuildNumber}.app folder:"
+          ls -l /Volumes/Android\ NDK\ ${latestNDK}/AndroidNDK${ndkBuildNumber}.app
+        
+          # Check the NDK folder inside the Contents directory
+          echo "Listing contents of the NDK directory:"
+          ls -l /Volumes/Android\ NDK\ ${latestNDK}/AndroidNDK${ndkBuildNumber}.app/Contents/NDK
+        
+          # Copy the NDK folder from the Contents/NDK directory
+          cp -R "/Volumes/Android NDK ${latestNDK}/AndroidNDK${ndkBuildNumber}.app/Contents/NDK" $HOME/ndk
+        
+          # Unmount the .dmg file
+          hdiutil detach "/Volumes/Android NDK ${latestNDK}"
+        
+          # Set NDK_PATH environment variable
+          export NDK_PATH=$HOME/ndk
+        
+          # Add NDK path to environment variables
+          echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
+          echo "Adding NDK to PATH"
+          echo "$NDK_PATH:$PATH" >> $GITHUB_PATH
+        
+          # Verify if the NDK was copied successfully and if ndk-build exists
+          ls -l $HOME/ndk
+          ls -l $NDK_PATH/ndk-build
+      
+      - name: Verify NDK Installation
+        run: |
+          echo "NDK Path: $NDK_PATH"
+          ls -l $NDK_PATH
+          # Check if ndk-build is accessible in the PATH
+          which ndk-build
+          # Check the version of ndk-build
+          ndk-build --version
+                
+      - name: Debug curl output # This step is for debugging
+        run: |
+          curl -s https://sqlite.org/download.html > sqlite_download_page.html
+          echo "--- Start of sqlite_download_page.html ---"
+          cat sqlite_download_page.html
+          echo "--- End of sqlite_download_page.html ---"
+          # The following YYYY_TEST and AMALGATION_TEST are for debugging this step only.
+          # They attempt to parse the CSV block directly here for verification.
+          CSV_LINE_TEST=$(cat sqlite_download_page.html | grep '^PRODUCT,[^,]*,[0-9]\{4\}/sqlite-amalgamation-[0-9]*\.zip' | head -n 1)
+          echo "CSV_LINE_TEST: $CSV_LINE_TEST"
+          YYYY_TEST=$(echo "$CSV_LINE_TEST" | cut -d',' -f3 | cut -d'/' -f1)
+          AMALGATION_ZIP_TEST=$(echo "$CSV_LINE_TEST" | cut -d',' -f3 | cut -d'/' -f2)
+          AMALGATION_TEST=$(echo "$AMALGATION_ZIP_TEST" | sed 's/\.zip$$//')
+          echo "YYYY_TEST (from debug step): $YYYY_TEST"
+          echo "AMALGATION_TEST (from debug step): $AMALGATION_TEST"
+          echo "AMALGATION_ZIP_TEST (from debug step): $AMALGATION_ZIP_TEST"
+      
+      - name: Source Makefile environment variables
+        run: |
+          # Ensure .sqlite_info is created and variables are available for subsequent make calls
+          make $(SQLITE_INFO_FILE) 
+          echo "--- Content of .sqlite_info after creation ---"
+          cat .sqlite_info || echo ".sqlite_info not found or empty"
+          echo "--- End of .sqlite_info content ---"
+
+          # Now that .sqlite_info exists, make print should work and variables should be set
+          SQLITE_AMALGATION_LINE=$(make --silent print | grep '^SQLITE_AMALGATION:')
+          SQLITE_AMALGATION=$(echo "$SQLITE_AMALGATION_LINE" | sed 's/^SQLITE_AMALGATION: //' | tr -d '[:space:]')
+          echo "SQLITE_AMALGATION_FROM_MAKE_PRINT=$SQLITE_AMALGATION" # For debugging
+          echo "SQLITE_AMALGATION=$SQLITE_AMALGATION" >> $GITHUB_ENV
+          echo "Extracted SQLITE_AMALGATION: $SQLITE_AMALGATION"
+
+          SQLITE_SOURCEURL_LINE=$(make --silent print | grep '^SQLITE_SOURCEURL:')
+          SQLITE_SOURCEURL=$(echo "$SQLITE_SOURCEURL_LINE" | sed 's/^SQLITE_SOURCEURL: //' | tr -d '[:space:]')
+          echo "SQLITE_SOURCEURL_FROM_MAKE_PRINT=$SQLITE_SOURCEURL" # For debugging
+          echo "SQLITE_SOURCEURL=$SQLITE_SOURCEURL" >> $GITHUB_ENV
+          echo "Extracted SQLITE_SOURCEURL: $SQLITE_SOURCEURL"
+          
+          # Verify variables are not empty
+          if [ -z "$SQLITE_AMALGATION" ] || [ -z "$SQLITE_SOURCEURL" ]; then
+            echo "Error: SQLITE_AMALGATION or SQLITE_SOURCEURL is empty after sourcing from Makefile."
+            ls -l .sqlite_info # Show .sqlite_info details
+            exit 1
+          fi
+      
+#      - name: Source Makefile environment variables
+#        run: |
+          # Extract variables from the Makefile
+#          SQLITE_AMALGATION=$(grep -E '^SQLITE_AMALGATION\s*:=\s*\S+' Makefile | sed -e 's/.*:= \(.*\)/\1/')
+#          SQLITE_SOURCEURL=$(grep -E '^SQLITE_SOURCEURL\s*:=\s*\S+' Makefile | sed -e 's/.*:= \(.*\)/\1/')
+#          SQLITE_SOURCEURL=$(echo "$SQLITE_SOURCEURL" | sed "s/\$(SQLITE_AMALGATION)/$SQLITE_AMALGATION/")
+#          SQLITE_SOURCEURL=$(echo "$SQLITE_SOURCEURL" | sed -e 's/ *#.*//')  # Remove trailing comments
+#          SQLITE_SOURCEURL="https://www.${SQLITE_SOURCEURL#*:\/\/}"  # Ensure URL has 'www.'
+
+          # Save variables to environment
+#          echo "SQLITE_AMALGATION=$SQLITE_AMALGATION" >> $GITHUB_ENV
+#          echo "SQLITE_SOURCEURL=$SQLITE_SOURCEURL" >> $GITHUB_ENV
+
+          # Print the extracted variables
+#          echo "SQLITE_AMALGATION: $SQLITE_AMALGATION"
+#          echo "SQLITE_SOURCEURL: $SQLITE_SOURCEURL"
+
+      - name: Download SQLite Source ZIP if needed
+        run: |
+          echo "SQLITE_SOURCEURL: $SQLITE_SOURCEURL"
+          if [ ! -f "${SQLITE_AMALGATION}.zip" ]; then
+            echo "Downloading SQLite..."
+            wget "$SQLITE_SOURCEURL" -O "${SQLITE_AMALGATION}.zip"
+          else
+            echo "SQLite archive already exists."
+          fi
+      
+      - name: Debugging - List current directory
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Listing files:"
+          ls -l
+        
+      - name: Create libs directory if it doesn't exist
+        run: |
+          mkdir -p libs/arm64-v8a libs/armeabi-v7a libs/x86 libs/x86_64
+
+      - name: Build SQLite using NDK
+        run: |
+          # Ensure NDK is in the PATH
+          export PATH=$NDK_PATH:$PATH
+        
+          # Define target architectures and build
+          TARGET_ARCH="arm64-v8a armeabi-v7a x86 x86_64"
+          make build TARGET_ABI="$TARGET_ARCH" INSTALL_DIR=libs V=1 || { echo 'Build failed'; exit 1; }
+        
+      - name: Check if SQLite binaries are created
+        run: |
+          if [ ! -f /Users/runner/work/sqlite3-android/sqlite3-android/libs/armeabi-v7a/sqlite3 ]; then
+            echo "Error: libs/armeabi-v7a/sqlite3 not found!"
+            exit 1
+          fi
+          if [ ! -f /Users/runner/work/sqlite3-android/sqlite3-android/libs/arm64-v8a/sqlite3 ]; then
+            echo "Error: libs/arm64-v8a/sqlite3 not found!"
+            exit 1
+          fi
+          if [ ! -f /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86/sqlite3 ]; then
+            echo "Error: libs/x86/sqlite3 not found!"
+            exit 1
+          fi
+          if [ ! -f /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86_64/sqlite3 ]; then
+            echo "Error: libs/x86_64/sqlite3 not found!"
+            exit 1
+          fi
+        
+      # Generate Release Info
+      - name: Generate Release Info
+        shell: bash
+        env:
+          GH_OWNER: ${{ github.repository_owner }} # This will be the repo owner's username (e.g., "arghya339")
+        run: |
+          # Get latest SQLite Version
+          SQLite_Version=$(curl -s https://sqlite.org/ | grep -oE 'Version [0-9]+\.[0-9]+\.[0-9]+' | cut -d' ' -f2)
+          
+          # Creating a changelog or release notes with dynamic sqlite version
+          echo "
+          **Change log** :point_down:
+          - Requires Android 5.0 and up
+          - Added support for multiple architectures (armeabi-v7a, arm64-v8a, x86, x86_64).
+          - Updated SQLite to the latest version. (v$SQLite_Version)
+          - Fixed bugs in the previous version.
+          - [sqlite](https://github.com/sqlite/sqlite/tags)
+
+          **How to use SQLite on Android** :point_down:
+          - install android-platform-tools:
+          Windows:
+          ~ winget install Google.PlatformTools --force --silent 
+          macOS:
+          ~ brew install --cask android-platform-tools
+          - starting adb:
+          ~ adb devices
+          - download sqlite binary for android:
+          Windows:
+          ~ \$arch = adb shell getprop ro.product.cpu.abi; Invoke-WebRequest -Uri https://github.com/$GH_OWNER/sqlite3-android/releases/download/all/sqlite-\$arch -OutFile \$env:USERPROFILE\Downloads\sqlite
+          macOS:
+          ~ arch=\$(adb shell getprop ro.product.cpu.abi) && curl -L "https://github.com/$GH_OWNER/sqlite3-android/releases/download/all/sqlite-\$arch" -o "\$HOME/Downloads/sqlite"
+          Termux with SU:
+          ~ arch=\$(getprop ro.product.cpu.abi) && curl -L "https://github.com/$GH_OWNER/sqlite3-android/releases/download/all/sqlite-\$arch" -o "\$HOME/sqlite"
+          - check sqlite exist or not in your device:
+          ~ adb shell ls -l /data/local/tmp/sqlite
+          Termux with SU:
+          ~ su -c \"ls -l /data/local/tmp/sqlite\"
+          - remove sqlite form device if it exist:
+          ~ adb shell rm /data/local/tmp/sqlite
+          Termux with SU:
+          ~ su -c \"rm /data/local/tmp/sqlite\"
+          - push the sqlite3 binary from computer Downloads dir to the device /data/local/tmp dir:
+          Windows:
+          ~ adb push \$env:USERPROFILE\Downloads\sqlite /data/local/tmp/
+          macOS:
+          ~ adb push \$HOME/Downloads/sqlite /data/local/tmp/
+          Termux with SU:
+          ~ su -c \"mv \$HOME/sqlite /data/local/tmp/\"
+          - give execute (--x) permission:
+          ~ adb shell chmod +x /data/local/tmp/sqlite
+          Termux with SU:
+          ~ su -c \"chmod +x /data/local/tmp/sqlite\"
+          - check the sqlite version:
+          ~ adb shell /data/local/tmp/sqlite --version
+          Termux with SU:
+          ~ su -c \"/data/local/tmp/sqlite --version\"
+          [Termux](https://github.com/termux/termux-app/releases/) w/o SU:
+          ~ arch=\$(getprop ro.product.cpu.abi) && curl -L \"https://github.com/$GH_OWNER/sqlite3-android/releases/download/all/sqlite-\$arch\" -o \"\$HOME/sqlite\" > /dev/null 2>&1 && chmod +x \"\$HOME/sqlite\" && echo && \"\$HOME/sqlite\" --version
+
+          **Full Changelog**: https://github.com/$GH_OWNER/sqlite3-android/commits/all
+          " > ${{ github.workspace }}/CHANGELOG.txt
+      
+      - name: Check if libs directory exists
+        run: |
+          if [ -d "/Users/runner/work/sqlite3-android/sqlite3-android/libs" ]; then
+            echo "libs directory exists"
+          else
+            echo "libs directory does not exist"
+            exit 1
+          fi
+                  
+      - name: List of child directory in libs directory
+        run: |
+          ls -d /Users/runner/work/sqlite3-android/sqlite3-android/libs
+      
+      - name: Rename artifacts
+        run: |
+          mv /Users/runner/work/sqlite3-android/sqlite3-android/libs/arm64-v8a/sqlite3 /Users/runner/work/sqlite3-android/sqlite3-android/libs/arm64-v8a/sqlite-arm64-v8a
+          mv /Users/runner/work/sqlite3-android/sqlite3-android/libs/armeabi-v7a/sqlite3 /Users/runner/work/sqlite3-android/sqlite3-android/libs/armeabi-v7a/sqlite-armeabi-v7a
+          mv /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86/sqlite3 /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86/sqlite-x86
+          mv /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86_64/sqlite3 /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86_64/sqlite-x86_64
+
+        # Release SQLite Binary for Android
+      - name: Create Release
+        uses: ncipollo/release-action@v1.18.0
+        with:
+          tag: all
+          artifacts: |
+            /Users/runner/work/sqlite3-android/sqlite3-android/libs/arm64-v8a/sqlite-arm64-v8a
+            /Users/runner/work/sqlite3-android/sqlite3-android/libs/armeabi-v7a/sqlite-armeabi-v7a
+            /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86/sqlite-x86
+            /Users/runner/work/sqlite3-android/sqlite3-android/libs/x86_64/sqlite-x86_64
+          name: SQLite Binary for Android
+          bodyFile: ${{ github.workspace }}/CHANGELOG.txt
+          allowUpdates: true
+          generateReleaseNotes: false
+          makeLatest: true  # Mark this release as the latest
+          omitBody: false
+          omitDraftDuringUpdate: false
+          omitName: false
+          omitPrereleaseDuringUpdate: false
+          removeArtifacts: false
+          replacesArtifacts: true  # Replaces artifacts from previous releases
+          skipIfReleaseExists: false
+          token: ${{ secrets.GITHUB_TOKEN }}  # Make sure your GitHub Token is available
+          updateOnlyUnreleased: false
+
+      - name: Clean up
+        run: make clean-all
+        # "Developer: @arghya339 (github.com/arghya339)"
+########################################################
