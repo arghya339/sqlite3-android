@@ -1,0 +1,155 @@
+# Copyright (C) 2025, Arghyadeep Mondal <github.com/arghya339>
+
+name: Build SQLite for Android
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  sqlite-version-check:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    outputs:
+      releaselog-url: ${{ steps.fetch_remote.outputs.releaselog_url }}
+      remote-version: ${{ steps.fetch_remote.outputs.remote_version }}
+      remote-year: ${{ steps.fetch_remote.outputs.remote_year }}
+      remote-version-code: ${{ steps.fetch_remote.outputs.remote_version_code }}
+      local-version: ${{ steps.get_local.outputs.local_version }}
+      local-version-code: ${{ steps.get_local.outputs.local_version_code }}
+      should-build: ${{ steps.compare_versions.outputs.build }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Fetch Remote Data
+        id: fetch_remote
+        run: |
+          homePageHtml=$(curl -sL https://sqlite.org)
+          releaselogUrl="https://sqlite.org/$(grep -E 'Version [0-9]+\.[0-9]+\.[0-9]+' <<< "$homePageHtml" | awk -F'"' '{print $2}')"
+          echo "releaselog_url=$releaselogUrl" >> $GITHUB_OUTPUT
+          remoteVersion=$(grep -oE 'Version [0-9]+\.[0-9]+\.[0-9]+' <<< "$homePageHtml" | cut -d' ' -f2)
+          echo "remote_version=$remoteVersion" >> $GITHUB_OUTPUT
+          sqliteAmalgamation=$(curl -sL https://sqlite.org/download.html | grep 'PRODUCT,.*sqlite-amalgamation.*\.zip' | awk -F, '{print $3}')
+          remoteYear=$(cut -d'/' -f1 <<< "$sqliteAmalgamation")
+          echo "remote_year=$remoteYear" >> $GITHUB_OUTPUT
+          remoteVersionCode=$(cut -d'-' -f3 <<< "$sqliteAmalgamation" | cut -d'.' -f1)
+          echo "remote_version_code=$remoteVersionCode" >> $GITHUB_OUTPUT
+      - name: Get Local Version
+        id: get_local
+        run: |
+          localVersion=$(cat Makefile | grep VERSION | head -1 | awk '{print $3}')
+          echo "local_version=$localVersion" >> $GITHUB_OUTPUT
+          localVersionCode=$(cat Makefile | grep VERSION_CODE | head -1 | awk '{print $3}')
+          echo "local_version_code=$localVersionCode" >> $GITHUB_OUTPUT
+      - name: Compare versions
+        id: compare_versions
+        run: |
+          if [ "${{ steps.fetch_remote.outputs.remote_version }}" != "${{ steps.get_local.outputs.local_version }}" ]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "Update available"
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+            echo "SQLite is up to date"
+          fi
+      - name: "Delete previous run of 2nd skipped job"
+        continue-on-error: true
+        run: |
+          databaseId=$(curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs" | jq -r --arg wn "$GITHUB_WORKFLOW" '.workflow_runs[1] | select(.name == $wn) | .id')
+          buildConclusion=$(curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$databaseId/jobs" | jq -r '.jobs[] | select(.name == "build").conclusion')
+          [ "$buildConclusion" == "skipped" ] && { curl -sX DELETE -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$databaseId" && echo "Run deleted."; } || true
+
+  build:
+    needs: sqlite-version-check
+    if: ${{ needs.sqlite-version-check.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Update VERSION, YEAR & VERSION_CODE
+        run: sed -i -e 's/^VERSION[[:space:]]*:=.*/VERSION             := ${{ needs.sqlite-version-check.outputs.remote-version }}/' -e 's/^YEAR[[:space:]]*:=.*/YEAR                := ${{ needs.sqlite-version-check.outputs.remote-year }}/' -e 's/^VERSION_CODE[[:space:]]*:=.*/VERSION_CODE        := ${{ needs.sqlite-version-check.outputs.remote-version-code }}/' Makefile
+      - name: Update ubuntu
+        run: sudo apt update
+      - name: Install aria2
+        run: sudo apt install aria2 -y
+      - name: Setup java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'jetbrains'
+          java-version: '11'
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27d
+          link-to-sdk: true
+      - name: Export Android NDK Path Globally
+        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+      - name: Build SQLite using Android NDK
+        run: |
+          export PATH=$ANDROID_NDK_HOME:$PATH
+          make
+      - name: Update binary
+        run: |
+          archs=(arm64-v8a armeabi-v7a x86_64 x86)
+          for arch in "${archs[@]}"; do cp libs/${arch}/sqlite3 binary/${arch}/sqlite3; done
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          [ "$(git --no-pager log -1 --pretty=%s)" == "Update SQLite" ] && git reset --soft HEAD~1
+          git add -A
+          git diff --cached --quiet || git commit -m "Update SQLite"
+          git push -f
+      - name: Rename binary
+        run: |
+          archs=(arm64-v8a armeabi-v7a x86_64 x86)
+          for arch in "${archs[@]}"; do mv libs/${arch}/sqlite3 libs/${arch}/sqlite3-${arch}; done
+      - name: Delete Previous release and tag
+        continue-on-error: true
+        run: |
+          tag="${{ needs.sqlite-version-check.outputs.local-version-code }}"
+          if curl -fsL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag &>/dev/null; then
+            releaseId=$(curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$tag | jq -r '.id')
+            curl -sX DELETE -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/$releaseId && echo "Release deleted."
+            curl -sX DELETE -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$tag && echo "Tag deleted."
+          else
+            echo "Tag $tag doesn't exist, skipping..."
+          fi
+      - name: Create & Publish a new release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ needs.sqlite-version-check.outputs.remote-version-code }}
+          name: "v${{ needs.sqlite-version-check.outputs.remote-version }}"
+          generateReleaseNotes: false
+          body: "**Tag:** https://github.com/sqlite/sqlite/releases/tag/version-${{ needs.sqlite-version-check.outputs.remote-version }}
+            **Changelog:** ${{ needs.sqlite-version-check.outputs.releaselog-url }}
+            "
+          artifacts: |
+            ${{ github.workspace }}/libs/arm64-v8a/sqlite3-arm64-v8a
+            ${{ github.workspace }}/libs/armeabi-v7a/sqlite3-armeabi-v7a
+            ${{ github.workspace }}/libs/x86_64/sqlite3-x86_64
+            ${{ github.workspace }}/libs/x86/sqlite3-x86
+          makeLatest: true
+          prerelease: false
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          skipIfReleaseExists: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Clean up
+        run: make clean-all
+      - name: "Delete previous run of 2nd success job"
+        continue-on-error: true
+        run: |
+          databaseId=$(curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs" | jq -r --arg wn "$GITHUB_WORKFLOW" '.workflow_runs[1] | select(.name == $wn) | .id')
+          buildConclusion=$(curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$databaseId/jobs" | jq -r '.jobs[] | select(.name == "build").conclusion')
+          [ "$buildConclusion" == "success" ] && { curl -sX DELETE -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$databaseId" && echo "Run deleted."; } || true
+######################################################################################################################################################################################################################################

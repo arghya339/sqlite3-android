@@ -1,3 +1,15 @@
+SQLite package build workflow
+---
+[![Build workflow](../../actions/workflows/build.yml/badge.svg)](../../actions/workflows/build.yml)
+
+This repository contains a workflow to build the sqlite binaries for Android.
+
+[Termux](https://github.com/termux/termux-app/releases/)
+---
+```sh
+curl -L --progress-bar -C - -o ~/sqlite3 "https://raw.githubusercontent.com/arghya339/sqlite3-android/refs/heads/master/binary/$(getprop ro.product.cpu.abi)/sqlite3" && chmod +x ~/sqlite3 && ~/sqlite3 --version && rm -f ~/sqlite3
+```
+
 Overview
 --------
 Makefile and Android.mk necessary to compile sqlite3 for Android.
